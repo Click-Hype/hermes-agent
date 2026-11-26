@@ -615,6 +615,12 @@ CREATE TABLE IF NOT EXISTS session_admissions (
 );
 CREATE INDEX IF NOT EXISTS session_admissions_pending
     ON session_admissions(target_session_id, status, seq);
+-- Read-only monitors look up unknown admissions by owner epoch across all sessions; the pending index
+-- leads with target_session_id, so without this they scanned the whole admission history. Partial:
+-- terminal admissions, the bulk of the table, pay nothing. owner_epoch ships with the table, never
+-- reconciler-added, so the index is safe here rather than in DEFERRED_INDEX_SQL.
+CREATE INDEX IF NOT EXISTS session_admissions_unknown_epoch
+    ON session_admissions(owner_epoch, admission_id) WHERE status = 'unknown';
 -- Cron run history finds a job's unified-runtime runs by the scheduler principal's request ids
 -- (``cron:<job>:<execution>``); without this a lookup walked
 -- every cron admission of every job. Partial: interactive turns, the bulk of admissions, pay
