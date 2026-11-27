@@ -475,7 +475,7 @@ async def serve_profile_runtime(runner, name, home):
             await recover_bot_mailbox(authority)
             recover_local_sessions(authority, schedule=True)
             await recover_webhook_finalizations(authority)
-            _recover_published_api_turns(runner, authority)
+            await _recover_published_api_turns(runner, authority)
         if getattr(runner, 'session_control_server', None) is not None:
             await _ensure_hosted_service(runner, authority)
     except BaseException:
@@ -500,14 +500,14 @@ def _drop_retired_local_adapter(authority):
         del adapters[Platform.LOCAL]
 
 
-def _recover_published_api_turns(runner, authority):
+async def _recover_published_api_turns(runner, authority):
     """Boot recovers queued API turns when the launch API adapter is published
     (``recover_api_turns``); a profile served after that runs the same pass on its own store."""
     from gateway.config import Platform
     api = (getattr(runner, 'adapters', None) or {}).get(Platform.API_SERVER)
     if api is not None:
-        from gateway.session_api_turn import recover_authority_api_turns
-        recover_authority_api_turns(api, authority)
+        from gateway.session_api_turn import recover_authority_api_turns_off_loop
+        await recover_authority_api_turns_off_loop(api, authority)
 
 
 async def recover_served_native_rows(runner):

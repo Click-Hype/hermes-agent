@@ -259,7 +259,12 @@ class SessionPersistenceMixin:
         self._db_handle_cache.close_all(_close)
 
     def _ensure_loaded(self) -> None:
-        """Load sessions index from disk if not already loaded."""
+        """Load sessions index from disk if not already loaded. Once loaded, and with nothing left to
+        reconcile, it returns without ``_lock``: the loop and the watchers call this every pass, and a
+        writer holding the lock across an fsync must not stall them."""
+        if self._loaded and (getattr(self, "_routing_db_loaded", False)
+                             or getattr(self, "_routing_fallback_baseline", None) is None):
+            return
         with self._lock:
             self._ensure_loaded_locked()
 

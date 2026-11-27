@@ -910,8 +910,14 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         """Register a connected primary adapter and wire voice mode/input (transcription without /voice join)."""
         self.adapters[platform] = adapter
         if platform == Platform.API_SERVER:
-            from gateway.session_api_turn import recover_api_turns
-            recover_api_turns(adapter)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:  # no loop to protect (a bare runner, a one-shot): recover inline
+                from gateway.session_api_turn import recover_api_turns
+                recover_api_turns(adapter)
+            else:  # the store sweep waits on the disk: publish now, recover in a worker thread
+                from gateway.session_api_turn import recover_api_turns_off_loop
+                self._retain_background_task(asyncio.create_task(recover_api_turns_off_loop(adapter)))
         self._sync_voice_mode_state_to_adapter(adapter)
         self._bind_voice_input_callback(adapter)
 

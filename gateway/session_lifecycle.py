@@ -175,8 +175,9 @@ class SessionLifecycleMixin:
             entry = self._entry_locked(session_key)
             if entry is None or mutate(entry) is False:
                 return False
-            self._save()
-            return True
+            snapshot = self._snapshot_routing_locked()
+        self._persist_routing_data(*snapshot)  # the write (fsync) runs after ``_lock`` is released
+        return True
 
     def _update_all_entries_locked(self, mutate) -> int:
         """Apply ``mutate(entry) -> bool`` to every entry under ``_lock``; save once if any
@@ -184,8 +185,9 @@ class SessionLifecycleMixin:
         with self._lock:
             self._ensure_loaded_locked()
             changed = sum(1 for entry in self._entries.values() if mutate(entry))
-            if changed:
-                self._save()
+            snapshot = self._snapshot_routing_locked() if changed else None
+        if snapshot is not None:
+            self._persist_routing_data(*snapshot)  # the write (fsync) runs after ``_lock`` is released
         return changed
 
     def suspend_session(self, session_key: str) -> bool:
