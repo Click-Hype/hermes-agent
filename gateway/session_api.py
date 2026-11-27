@@ -327,14 +327,22 @@ def restore_api_session(authority, session_id):
     store = authority.runner.session_store
     target = authority.physical_target(SessionRef(authority.profile_id, session_id))
     entry.session_id = target
-    with store._lock:
-        store._ensure_loaded_locked()
+    store._ensure_loaded()
+    while True:
+        # The store reads run before ``_lock``: a writer holding it across an fsync would otherwise
+        # keep every caller of this restore waiting behind the disk twice over.
         current = store._entries.get(entry.session_key)
         if current is not None and current.session_id not in authority.db.get_compression_lineage(session_id):
             with authority.db._read_ctx() as conn:
                 if not _heal_replacement(conn, session_id, current.session_id):
                     raise RuntimeStoreError('admission_conflict')
-        store._entries[entry.session_key] = current if current is not None and current.session_id == target else entry
+        with store._lock:
+            store._ensure_loaded_locked()
+            if store._entries.get(entry.session_key) is not current:
+                continue  # the entry changed under the reads: judge the new one
+            store._entries[entry.session_key] = (
+                current if current is not None and current.session_id == target else entry)
+            break
     from gateway.session_history_mount import is_history_mount
     live = authority.sessions.get(session_id)
     if live is None:

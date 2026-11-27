@@ -288,28 +288,70 @@ def recover_api_turns(adapter):
             recover_authority_api_turns(adapter, authority)
 
 
-def recover_authority_api_turns(adapter, authority):
-    from hermes_state_runtime import list_session_admissions
+def _sweep_api_payloads(authority):
+    """The SQL half of API-turn recovery: collect unheld images, compact settled payloads, and list the
+    sessions with queued work. Every statement here can wait on the disk (a cold, large ``state.db`` takes
+    minutes on a saturated one), so the running gateway never calls it on the loop."""
     from gateway.session_ingress_media import collect_unheld_api_images
-    import logging
     collect_unheld_api_images(authority.db)
     from gateway.session_api_media import compact_settled_api_payloads
     compact_settled_api_payloads(authority.db)
     with authority.db._read_ctx() as conn:
-        targets = [row[0] for row in conn.execute(
+        return [row[0] for row in conn.execute(
             "SELECT DISTINCT target_session_id FROM session_admissions WHERE principal_id='api' AND status='queued'")]
-    for sid in targets:
+
+
+def _prepare_queued_api_session(authority, sid):
+    """Restore one session and recheck its queued turns (store reads and the routing lock). The ref to
+    schedule, or None when an ``unknown`` admission keeps the session paused."""
+    from hermes_state_runtime import list_session_admissions
+    ref = restore_api_session(authority, sid)
+    pending = list_session_admissions(authority.db, session_id=sid)
+    if any(row['status'] == 'unknown' for row in pending):
+        return None
+    for row in pending:
+        if row['status'] == 'queued':
+            check_api_turn(authority, ref, row['payload'])
+    return ref
+
+
+def recover_authority_api_turns(adapter, authority):
+    """Synchronous recovery, for callers with no running loop (a bare runner, tests)."""
+    import logging
+    for sid in _sweep_api_payloads(authority):
         try:
-            ref = restore_api_session(authority, sid)
-            pending = list_session_admissions(authority.db, session_id=sid)
-            if any(row['status'] == 'unknown' for row in pending):
-                continue
-            for row in pending:
-                if row['status'] == 'queued':
-                    check_api_turn(authority, ref, row['payload'])
-            authority._schedule(ref)
+            ref = _prepare_queued_api_session(authority, sid)
+            if ref is not None:
+                authority._schedule(ref)
         except RuntimeStoreError as exc:
             logging.getLogger(__name__).warning('API session %s paused: %s', sid, exc.reason)
+
+
+async def recover_authority_api_turns_off_loop(adapter, authority):
+    """``recover_authority_api_turns`` with every store read and the routing lock in a worker thread;
+    only the scheduling (it creates a task) runs on the loop, so a slow ``state.db`` delays the
+    recovery and never the loop."""
+    import logging
+    for sid in await asyncio.to_thread(_sweep_api_payloads, authority):
+        try:
+            ref = await asyncio.to_thread(_prepare_queued_api_session, authority, sid)
+            if ref is not None:
+                authority._schedule(ref)
+        except RuntimeStoreError as exc:
+            logging.getLogger(__name__).warning('API session %s paused: %s', sid, exc.reason)
+
+
+async def recover_api_turns_off_loop(adapter):
+    """Boot recovery of queued API turns after the adapter is published, without blocking the loop.
+    A store that cannot answer leaves its rows queued for the next start and never stops the others."""
+    import logging
+    from gateway.session_authorities import owner_scope, serving_authorities
+    for authority in serving_authorities(adapter.gateway_runner):
+        try:
+            with owner_scope(authority):
+                await recover_authority_api_turns_off_loop(adapter, authority)
+        except Exception:  # health: allow BLE001 -- logged; the rows stay queued for the next start
+            logging.getLogger(__name__).error('API turn recovery failed for %s', authority.profile_id, exc_info=True)
 
 
 async def run_api_turn(adapter, *, approval_notify_callback=None, approval_session_key=None, **kwargs):
