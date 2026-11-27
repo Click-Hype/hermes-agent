@@ -112,7 +112,7 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                 # must not create backups/ inside that profile.
                 if config_path == _config.get_config_path():
                     from hermes_cli.config_backups import backup_config
-                    backup_config(config_path, "good")
+                    backup_config(config_path, "good", skip_if_unchanged=True)
 
         if fail_closed and root_is_mapping is None:
             # Raw-config cache hits contain only normalized dicts, not the root shape.

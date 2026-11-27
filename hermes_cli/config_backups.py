@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 BACKUPS_SUBDIR = Path("backups") / "config"
 DEFAULT_KEEP = 5
 
+# (path, reason) -> (inode, size, mtime_ns) of the config this process already backed up (or found
+# identical to its newest copy). A load that misses the config cache for another reason re-reads an
+# unchanged file; with ``skip_if_unchanged`` it must not also re-scan the backups dir on a disk that fsyncs
+# in hundreds of ms.
+_BACKED_UP_STAT: dict[tuple[str, str], tuple[int, int, int]] = {}
+
 # Names earlier code wrote next to config.yaml (setup wizard, corrupt snapshot, xai migration).
 # Moved into the backups dir on first use so they stop accumulating in the home root; hand-named
 # copies (``config.yaml.bak-my-note``) are the user's and are never touched.
@@ -41,8 +47,13 @@ def list_config_backups(config_path: Path, reason: Optional[str] = None) -> list
                   key=lambda p: p.name, reverse=True)
 
 
-def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -> Optional[Path]:
+def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP,
+                  skip_if_unchanged: bool = False) -> Optional[Path]:
     """Copy *config_path* to the backups dir; return the new path, or None when skipped/failed.
+
+    ``skip_if_unchanged``: a file whose inode, size and mtime match what this process already backed up
+    for *reason* returns at once, before the directory is created, swept or listed (the per-load
+    "good" copy; the writers that need a "before" copy keep the byte comparison).
 
     Skips when the file is missing/empty, or when the newest backup for *reason* already holds
     identical bytes. Never raises: a failed backup must not block the write it precedes.
@@ -52,7 +63,12 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
     if not supports_file_tooling():
         return None
     try:
-        if not config_path.is_file() or config_path.stat().st_size == 0:  # config-reader: ok — file tooling, gated above
+        stat = config_path.stat()  # config-reader: ok — file tooling, gated above
+        if not config_path.is_file() or stat.st_size == 0:
+            return None
+        signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        memo_key = (str(config_path), reason)
+        if skip_if_unchanged and _BACKED_UP_STAT.get(memo_key) == signature:
             return None
         root = backups_dir(config_path)
         root.mkdir(parents=True, exist_ok=True)
@@ -68,6 +84,7 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         # Not filecmp.cmp: its process-wide cache keys on (size, mtime), so an equal-size edit
         # within one mtime tick of an earlier comparison is reported identical and never backed up.
         if existing and config_path.read_bytes() == existing[0].read_bytes():  # config-reader: ok — file tooling, gated above
+            _BACKED_UP_STAT[memo_key] = signature
             return None
         dest = root / f"{config_path.name}.{reason}.{time.strftime('%Y%m%d-%H%M%S')}"
         if dest.is_symlink() or dest.exists():  # never write through a planted link
@@ -79,6 +96,7 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         _secure_file(dest)
         for stale in [dest, *existing][keep:]:
             stale.unlink(missing_ok=True)
+        _BACKED_UP_STAT[memo_key] = signature
         return dest
     except OSError as exc:
         logger.warning("Could not back up %s (%s): %s", config_path, reason, exc)
