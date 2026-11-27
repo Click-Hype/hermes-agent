@@ -3,11 +3,14 @@ replayed-user dedupe. Mixin bound via the MRO, built on SessionDB's _read_ctx/_e
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import re
+import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from agent.context_compressor import (
@@ -119,6 +122,31 @@ def _stale_holder(row, now: float) -> bool:
     """A lock/lease row whose holder is expired or a provably dead local process."""
     from hermes_state import _compression_lock_holder_process_is_dead
     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
+
+
+_COMPACTION_GATES: dict[str, "threading.Lock"] = {}
+_COMPACTION_GATES_GUARD = threading.Lock()
+_COMPACTION_GATE_LOG_AFTER_S = 1.0
+
+
+@contextlib.contextmanager
+def _compaction_gate(db):
+    """The per-state.db gate ``archive_and_compact`` queues on (keyed by the resolved path, so every handle
+    of one profile's store shares it). Logs a wait longer than a second: that is a profile compacting
+    faster than its disk commits."""
+    try:
+        key = str(Path(db.db_path).resolve())
+    except (AttributeError, TypeError, OSError):
+        key = str(getattr(db, "db_path", id(db)))
+    with _COMPACTION_GATES_GUARD:
+        gate = _COMPACTION_GATES.setdefault(key, threading.Lock())
+    began = time.monotonic()
+    with gate:
+        waited = time.monotonic() - began
+        if waited >= _COMPACTION_GATE_LOG_AFTER_S:
+            logger.info("state.db compaction waited %.1fs behind another compaction of %s", waited, key)
+        yield
+
 
 
 class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, SessionStoredReadsMixin):
@@ -945,11 +973,15 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         above the watermark or left unnamed) is not cloned: the carried copy is its one live row and the
         original takes rewind flags (#137197).
         """
-        return self._execute_transcript_write(lambda conn: self._archive_and_compact_on_conn(
-            conn, session_id, compacted_messages, model_config_patch=model_config_patch,
-            watermark=watermark, lock_holder=lock_holder, tail_count=tail_count,
-            carried_messages=carried_messages, covered_ids=covered_ids,
-            unresolved_held=unresolved_held, held_for_cas=held_for_cas), compacted_messages)
+        # One compaction at a time per state.db: each is a large transaction with its own commit
+        # fsync, and a queue of them behind the writer mutex starves the short turn writes that
+        # wait on the same mutex. They queue here instead, so a turn write slips in between two.
+        with _compaction_gate(self):
+            return self._execute_transcript_write(lambda conn: self._archive_and_compact_on_conn(
+                conn, session_id, compacted_messages, model_config_patch=model_config_patch,
+                watermark=watermark, lock_holder=lock_holder, tail_count=tail_count,
+                carried_messages=carried_messages, covered_ids=covered_ids,
+                unresolved_held=unresolved_held, held_for_cas=held_for_cas), compacted_messages)
 
     def _archive_and_compact_on_conn(
             self, conn, session_id: str, compacted_messages: list[dict[str, Any]], *,
